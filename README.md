@@ -1,10 +1,10 @@
 # Website availability service
 
-A small Go microservice that checks six fixed websites concurrently. It uses Go's
+A small Go microservice that checks websites from a file concurrently. It uses Go's
 standard library, so there are no third-party dependencies or framework setup.
 
 ```sh
-go run ./cmd/checker
+go run ./cmd/checker --urllist ./list
 curl http://localhost:8080/check
 ```
 
@@ -14,16 +14,18 @@ The JSON response contains one entry per site, in the configured order:
 {"sites":[{"url":"https://google.com","available":true,"status_code":200}]}
 ```
 
-The example shows one entry; the actual response contains all six. The service
-uses HTTPS GET, follows redirects, and considers a final HTTP status from 200
+The example shows one entry; the actual response contains one per configured URL.
+The service uses HTTP GET, follows redirects, and considers a final HTTP status from 200
 through 399 available. Other statuses and connection errors are unavailable.
-Each request has a five-second timeout. The endpoint itself returns HTTP 200
+Each site check has a five-second timeout; up to ten checks run concurrently. The endpoint itself returns HTTP 200
 when the checks complete, even if individual sites are unavailable; inspect each
 site's `available` field. Results reflect this server's network and may differ
 from what a browser sees. Sites can block automated requests or return errors.
 
-The list includes `amazom.com` exactly as requested; change it in `internal/checker/checker.go` if
-`amazon.com` was intended. Stop the service with Ctrl+C. To run the tests:
+The sample `list` contains one full HTTP(S) URL per line, including `amazom.com`
+exactly as requested. Blank lines and lines beginning with `#` are ignored.
+The file is read and validated once at startup; restart the server after changes.
+Only use a trusted list: the service can reach addresses available to its host. Stop the service with Ctrl+C. To run the tests:
 
 ```sh
 go test -race ./...
@@ -36,6 +38,7 @@ go test -race ./...
 - `internal/checker/checker.go` implements the endpoint and website checks.
   Go restricts packages under `internal` to code within this module's parent
   tree, making it a useful place for implementation details.
+- `internal/checker/urls.go` loads and validates the configured file.
 - `internal/checker/checker_test.go` tests the checker without external network
   access.
 - `go.mod` identifies the module and its Go version.
@@ -43,3 +46,10 @@ go test -race ./...
 Go modules use the module root as the source root; a separate `src` directory
 is not required. Add packages or files as the project grows rather than
 creating directories for every possible future component.
+
+The handler uses the request context's `Done` channel for cancellation. Workers
+send results to a results channel and send a completion signal to a separate
+channel when they exit. A coordinator receives one completion signal per worker
+and then closes the results channel. The receiver ranges over that channel until it closes. Although the
+file's length is known after loading, this pattern also works when a receiver
+does not know the number of results in advance.

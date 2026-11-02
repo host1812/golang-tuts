@@ -8,14 +8,6 @@ import (
 	"net/http"
 )
 
-// Keep the targets on the server rather than accepting arbitrary URLs from a
-// caller. This also prevents callers from using the service to probe internal
-// addresses (a common server-side request forgery, or SSRF, risk).
-var Sites = []string{
-	"https://google.com", "https://microsoft.com", "https://amazom.com",
-	"https://yahoo.com", "https://cnn.com", "https://weather.com",
-}
-
 // A result describes what this service observed, not whether a website is
 // accessible to every user on the internet.
 type result struct {
@@ -29,7 +21,7 @@ type checkResponse struct {
 	Sites []result `json:"sites"`
 }
 
-// checkHandler accepts its dependencies as arguments. This makes the handler
+// Handler accepts its dependencies as arguments. This makes the handler
 // easy to test with local HTTP servers, without contacting real websites.
 func Handler(client *http.Client, targets []string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -40,24 +32,59 @@ func Handler(client *http.Client, targets []string) http.HandlerFunc {
 			result result
 		}
 		results := make([]result, len(targets))
-		// A buffered channel holds one result per worker. Workers can finish
-		// their sends even if the handler has not started receiving yet.
-		resultsCh := make(chan indexedResult, len(targets))
-		for i, target := range targets {
-			go func(i int, target string) {
-				siteResult := checkSite(r.Context(), client, target)
-				// The arrow points toward the channel when sending a value.
-				resultsCh <- indexedResult{index: i, result: siteResult}
-			}(i, target)
+		// An unbuffered channel passes each result directly to the receiver.
+		resultsCh := make(chan indexedResult)
+		type job struct {
+			index  int
+			target string
 		}
-		// Receive exactly one result per target. Each receive waits until a
-		// result is available; only this goroutine writes to the slice.
-		for range targets {
-			received := <-resultsCh
+		jobs := make(chan job)
+		// Limit concurrency so a large input file does not start thousands of
+		// simultaneous requests. Each worker handles jobs until jobs closes.
+		const workerCount = 10
+		// Each worker sends one empty value when it exits. The buffer lets
+		// every worker signal completion without waiting for the receiver.
+		workerDone := make(chan struct{}, workerCount)
+		for range workerCount {
+			go func() {
+				defer func() { workerDone <- struct{}{} }()
+				for j := range jobs {
+					siteResult := checkSite(r.Context(), client, j.target)
+					// If the caller leaves, do not get stuck trying to send
+					// a result that nobody is receiving.
+					select {
+					case resultsCh <- indexedResult{index: j.index, result: siteResult}:
+					case <-r.Context().Done():
+						return
+					}
+				}
+			}()
+		}
+		go func() {
+			defer close(jobs) // Only the sender closes the jobs channel.
+			for i, target := range targets {
+				select {
+				case jobs <- job{index: i, target: target}:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}()
+		go func() {
+			// Receive one completion signal from each worker before closing
+			// resultsCh; no worker can send another result after signaling.
+			for range workerCount {
+				<-workerDone
+			}
+			// Close only after every sender has stopped, so sending on a
+			// closed channel is impossible. This signals end of results.
+			close(resultsCh)
+		}()
+		// Range receives until resultsCh is closed and drained. It does not
+		// need to know how many results will arrive.
+		for received := range resultsCh {
 			results[received.index] = received.result
 		}
-		// We know exactly how many values to receive, so closing the channel
-		// is unnecessary. It will be garbage collected when no longer used.
 
 		// If the caller has disconnected, there is no response to deliver.
 		if r.Context().Err() != nil {

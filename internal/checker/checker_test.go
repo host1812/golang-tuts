@@ -55,3 +55,26 @@ func TestCheckSiteCanceled(t *testing.T) {
 		t.Fatalf("expected cancellation error, got %+v", got)
 	}
 }
+
+func TestHandlerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/check", nil).WithContext(ctx)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		Handler(client, []string{"https://example.com"})(httptest.NewRecorder(), req)
+	}()
+	<-started
+	cancel()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not stop after cancellation")
+	}
+}
